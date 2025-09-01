@@ -1,0 +1,530 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ECS Fargate: Frontend (public via ALB) + Backend (private via Cloud Map), VPC, NAT, Auto Scaling'
+
+Parameters:
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: 'VPC CIDR block (/16 ≈ 65K IPs; network 10.0.0.0, mask 255.255.0.0)'
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: 'Public subnet 1 CIDR'
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: 'Public subnet 2 CIDR'
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 10.0.3.0/24
+    Description: 'Private subnet 1 CIDR'
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.0.4.0/24
+    Description: 'Private subnet 2 CIDR'
+
+  FrontendImage:
+    Type: String
+    Default: '982081087075.dkr.ecr.us-east-1.amazonaws.com/accounting:latest'
+    Description: 'ECR image for the frontend container'
+  BackendImage:
+    Type: String
+    Default: '982081087075.dkr.ecr.us-east-1.amazonaws.com/forum:latest'
+    Description: 'ECR image for the backend container'
+
+  FrontendContainerPort:
+    Type: Number
+    Default: 80
+    Description: 'Frontend container port'
+  BackendContainerPort:
+    Type: Number
+    Default: 8080
+    Description: 'Backend container port'
+
+  BackendDesiredCount:
+    Type: Number
+    Default: 1
+    Description: 'Initial desired task count for backend'
+  FrontendDesiredCount:
+    Type: Number
+    Default: 1
+    Description: 'Initial desired task count for frontend'
+
+  CpuTargetUtilization:
+    Type: Number
+    Default: 70
+    Description: 'Target CPU utilization (%) for auto scaling'
+
+  HealthCheckPath:
+    Type: String
+    Default: /
+    Description: 'ALB target group health check path for the frontend'
+
+  CloudMapNamespaceName:
+    Type: String
+    Default: forum.local
+    Description: 'Private DNS namespace for backend service discovery (Cloud Map)'
+
+  MongodbUserParamName:
+    Type: String
+    Default: "/backend/forum/MONGODB_USER"
+    Description: "SSM Parameter name for MongoDB user"
+  MongodbBaseParamName:
+    Type: String
+    Default: "/backend/forum/MONGODB_BASE"
+    Description: "SSM Parameter name for MongoDB database"
+  MongodbPasswordParamName:
+    Type: String
+    Default: "/backend/forum/MONGODB_PASSWORD"
+    Description: "SSM Parameter name for MongoDB password (SecureString)"
+
+Mappings: {}
+
+Resources:
+  ################################
+  # Networking: VPC, Subnets, RT #
+  ################################
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: MyApp-VPC }]
+
+  Igw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: MyApp-IGW }]
+
+  VpcIgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref Igw
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnet1Cidr
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{ Key: Name, Value: PublicSubnet1 }]
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnet2Cidr
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags: [{ Key: Name, Value: PublicSubnet2 }]
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{ Key: Name, Value: PrivateSubnet1 }]
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags: [{ Key: Name, Value: PrivateSubnet2 }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: PublicRT }]
+
+  PublicRouteToIgw:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Igw
+
+  PublicSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  EipForNat:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      AllocationId: !GetAtt EipForNat.AllocationId
+      Tags: [{ Key: Name, Value: MyApp-NAT }]
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: PrivateRT }]
+
+  PrivateRouteToNat:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  ##########################
+  # Security Groups        #
+  ##########################
+  AlbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'ALB security group (ingress 80 from internet)'
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags: [{ Key: Name, Value: frontend-alb-sg }]
+
+  FrontendTasksSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Frontend tasks (allow only from ALB SG)'
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref FrontendContainerPort
+          ToPort: !Ref FrontendContainerPort
+          SourceSecurityGroupId: !Ref AlbSG
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags: [{ Key: Name, Value: frontend-tasks-sg }]
+
+  BackendTasksSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Backend tasks (allow only from Frontend tasks SG)'
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref BackendContainerPort
+          ToPort: !Ref BackendContainerPort
+          SourceSecurityGroupId: !Ref FrontendTasksSG
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags: [{ Key: Name, Value: backend-tasks-sg }]
+
+  ##########################
+  # ECS + IAM + Logs       #
+  ##########################
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: MyApp-Cluster
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub MyApp-ECS-ExecutionRole-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+        - arn:aws:iam::aws:policy/AmazonSSMReadOnlyAccess
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub MyApp-ECS-TaskRole-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+
+  LogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/myapp/${AWS::StackName}
+      RetentionInDays: 14
+
+  ##########################
+  # Cloud Map Namespace    #
+  ##########################
+  PrivateNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: !Ref CloudMapNamespaceName
+      Vpc: !Ref Vpc
+      Description: 'Private DNS namespace for backend'
+
+  BackendDiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: backend
+      NamespaceId: !Ref PrivateNamespace
+      DnsConfig:
+        DnsRecords:
+          - Type: A
+            TTL: 60
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+
+  ##########################
+  # ALB (public)           #
+  ##########################
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: frontend-alb
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups: [!Ref AlbSG]
+      Subnets: [!Ref PublicSubnet1, !Ref PublicSubnet2]
+
+  FrontendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: frontend-tg
+      TargetType: ip
+      VpcId: !Ref Vpc
+      Protocol: HTTP
+      Port: !Ref FrontendContainerPort
+      HealthCheckEnabled: true
+      HealthCheckPath: !Ref HealthCheckPath
+      Matcher:
+        HttpCode: '200-399'
+
+  HTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref FrontendTargetGroup
+
+  ########################################
+  # Task Definitions (Fargate, awsvpc)   #
+  ########################################
+  BackendTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: backend-task
+      Cpu: '512'
+      Memory: '1024'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: backend
+          Image: !Ref BackendImage
+          PortMappings:
+            - ContainerPort: !Ref BackendContainerPort
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogsGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: backend
+          Environment:
+            - Name: APP_ENV
+              Value: production
+          Secrets:
+            - Name: MONGODB_USER
+              ValueFrom: !Ref MongodbUserParamName
+            - Name: MONGODB_BASE
+              ValueFrom: !Ref MongodbBaseParamName
+            - Name: MONGODB_PASSWORD
+              ValueFrom: !Ref MongodbPasswordParamName
+
+  FrontendTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: frontend-task
+      Cpu: '512'
+      Memory: '1024'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: frontend
+          Image: !Ref FrontendImage
+          PortMappings:
+            - ContainerPort: !Ref FrontendContainerPort
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogsGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: frontend
+          Environment:
+            - Name: BACKEND_BASE_URL
+              Value: !Sub "http://backend.${CloudMapNamespaceName}:${BackendContainerPort}"
+          HealthCheck:
+            Command: ["CMD-SHELL", "curl -fsS http://127.0.0.1:80/ || exit 1"]
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 10
+
+  ##########################
+  # ECS Services           #
+  ##########################
+  BackendService:
+    Type: AWS::ECS::Service
+    DependsOn: PrivateRouteToNat
+    Properties:
+      Cluster: !Ref ECSCluster
+      ServiceName: backend-service
+      LaunchType: FARGATE
+      DesiredCount: !Ref BackendDesiredCount
+      TaskDefinition: !Ref BackendTaskDef
+      EnableExecuteCommand: false
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+          SecurityGroups: [!Ref BackendTasksSG]
+      ServiceRegistries:
+        - RegistryArn: !GetAtt BackendDiscoveryService.Arn
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+
+  FrontendService:
+    Type: AWS::ECS::Service
+    DependsOn: HTTPListener
+    Properties:
+      Cluster: !Ref ECSCluster
+      ServiceName: frontend-service
+      LaunchType: FARGATE
+      DesiredCount: !Ref FrontendDesiredCount
+      TaskDefinition: !Ref FrontendTaskDef
+      EnableExecuteCommand: false
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+          SecurityGroups: [!Ref FrontendTasksSG]
+      LoadBalancers:
+        - TargetGroupArn: !Ref FrontendTargetGroup
+          ContainerName: frontend
+          ContainerPort: !Ref FrontendContainerPort
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+
+  ########################################
+  # Application Auto Scaling (per svc)   #
+  ########################################
+  ScalableTargetFrontend:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: 6
+      MinCapacity: !Ref FrontendDesiredCount
+      ResourceId: !Sub service/${ECSCluster}/${FrontendService.Name}
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  ScalingPolicyFrontendCPU:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: FrontendTargetTrackingCPU
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTargetFrontend
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: !Ref CpuTargetUtilization
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleInCooldown: 60
+        ScaleOutCooldown: 60
+
+  ScalableTargetBackend:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: 6
+      MinCapacity: !Ref BackendDesiredCount
+      ResourceId: !Sub service/${ECSCluster}/${BackendService.Name}
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  ScalingPolicyBackendCPU:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: BackendTargetTrackingCPU
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTargetBackend
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: !Ref CpuTargetUtilization
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleInCooldown: 60
+        ScaleOutCooldown: 60
+
+Outputs:
+  AlbDNSName:
+    Description: 'Public DNS name of the ALB (frontend entrypoint)'
+    Value: !GetAtt ALB.DNSName
+
+  CloudMapNamespaceId:
+    Description: 'ID of the private DNS namespace'
+    Value: !Ref PrivateNamespace
+
+  ECSClusterName:
+    Description: 'ECS cluster name'
+    Value: !Ref ECSCluster
+
+  FrontendServiceName:
+    Description: 'Frontend ECS service name'
+    Value: !GetAtt FrontendService.Name
+
+  BackendServiceName:
+    Description: 'Backend ECS service name'
+    Value: !GetAtt BackendService.Name
+
